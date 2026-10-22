@@ -22,6 +22,7 @@ SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 PANEL_PORT = int(os.getenv("PANEL_PORT", "8443"))
 PANEL_SSL_CERT = os.getenv("PANEL_SSL_CERT", "")
 PANEL_SSL_KEY = os.getenv("PANEL_SSL_KEY", "")
+PROXY_ADVERTISED_HOST = os.getenv("PROXY_ADVERTISED_HOST", "")
 store = Store()
 store.initialize()
 active: dict[int, asyncio.AbstractServer] = {}
@@ -188,7 +189,9 @@ async def logout(request: Request):
 async def list_listeners(request: Request):
     require_login(request)
     items = store.list_listeners()
-    hostname = request.url.hostname or "SERVER_IP"
+    hostname = PROXY_ADVERTISED_HOST or request.url.hostname or "VPS_IP"
+    if hostname.endswith(".manus.computer"):
+        hostname = "VPS_IP"
     if ":" in hostname and not hostname.startswith("["):
         hostname = f"[{hostname}]"
     for item in items:
