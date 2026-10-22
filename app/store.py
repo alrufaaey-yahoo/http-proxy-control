@@ -48,13 +48,13 @@ class Store:
                 port INTEGER NOT NULL UNIQUE,
                 username TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
-                tls_enabled INTEGER NOT NULL DEFAULT 1,
+                tls_enabled INTEGER NOT NULL DEFAULT 0,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )""")
             columns = {row[1] for row in db.execute("PRAGMA table_info(listeners)")}
             if "tls_enabled" not in columns:
-                db.execute("ALTER TABLE listeners ADD COLUMN tls_enabled INTEGER NOT NULL DEFAULT 1")
+                db.execute("ALTER TABLE listeners ADD COLUMN tls_enabled INTEGER NOT NULL DEFAULT 0")
 
     def list_listeners(self) -> list[dict[str, Any]]:
         with self._connect() as db:
@@ -71,7 +71,7 @@ class Store:
             row = db.execute("SELECT * FROM listeners WHERE port=?", (port,)).fetchone()
             return dict(row) if row else None
 
-    def create_listener(self, port: int, username: str, password: str, tls_enabled: bool = True) -> int:
+    def create_listener(self, port: int, username: str, password: str, tls_enabled: bool = False) -> int:
         with self._connect() as db:
             cur = db.execute(
                 "INSERT INTO listeners(port,username,password_hash,tls_enabled,enabled) VALUES(?,?,?,?,1)",
@@ -90,6 +90,10 @@ class Store:
                            (username, password_hash(password), listener_id))
             else:
                 db.execute("UPDATE listeners SET username=? WHERE id=?", (username, listener_id))
+
+    def set_tls_enabled(self, listener_id: int, enabled: bool) -> None:
+        with self._connect() as db:
+            db.execute("UPDATE listeners SET tls_enabled=? WHERE id=?", (int(enabled), listener_id))
 
     def delete_listener(self, listener_id: int) -> None:
         with self._connect() as db:

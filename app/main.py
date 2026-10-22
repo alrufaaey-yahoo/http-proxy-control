@@ -31,8 +31,8 @@ login_attempts: dict[str, list[float]] = {}
 class ListenerInput(BaseModel):
     port: int = Field(ge=1024, le=65535)
     username: str = Field(min_length=1, max_length=64)
-    password: str = Field(min_length=12, max_length=256)
-    tls_enabled: bool = True
+    password: str = Field(min_length=3, max_length=256)
+    tls_enabled: bool = False
 
     @field_validator("username")
     @classmethod
@@ -52,7 +52,8 @@ class ListenerInput(BaseModel):
 class ListenerUpdate(BaseModel):
     enabled: bool | None = None
     username: str | None = Field(default=None, min_length=1, max_length=64)
-    password: str | None = Field(default=None, min_length=12, max_length=256)
+    password: str | None = Field(default=None, min_length=3, max_length=256)
+    tls_enabled: bool | None = None
 
     @field_validator("username")
     @classmethod
@@ -187,9 +188,13 @@ async def logout(request: Request):
 async def list_listeners(request: Request):
     require_login(request)
     items = store.list_listeners()
+    hostname = request.url.hostname or "SERVER_IP"
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
     for item in items:
         item["running"] = item["id"] in active
-        item["address"] = f"{'https' if item['tls_enabled'] else 'http'}://0.0.0.0:{item['port']}"
+        scheme = "https" if item["tls_enabled"] else "http"
+        item["address"] = f"{scheme}://{hostname}:{item['port']}"
     return {"listeners": items}
 
 
@@ -222,30 +227,30 @@ async def update_listener(listener_id: int, payload: ListenerUpdate, request: Re
     fields = payload.model_dump(exclude_unset=True)
     if not fields:
         raise HTTPException(status_code=400, detail="No changes supplied")
+    target_tls = fields.get("tls_enabled", bool(listener["tls_enabled"]))
+    if target_tls and (not PANEL_SSL_CERT or not PANEL_SSL_KEY):
+        raise HTTPException(status_code=409, detail="TLS certificate is not configured on this server")
     username = fields.get("username", listener["username"])
     password = fields.get("password")
+    config_changed = any(key in fields for key in ("username", "password", "tls_enabled"))
+    if config_changed:
+        await stop_listener(listener_id)
     if "username" in fields or password:
         store.update_credentials(listener_id, username, password)
-    if "enabled" in fields:
-        if fields["enabled"]:
-            fresh = store.get_listener(listener_id)
-            try:
-                await start_listener(fresh)
-            except OSError as exc:
-                raise HTTPException(status_code=409, detail=f"Could not bind listener: {exc.strerror or 'port unavailable'}")
-            store.set_enabled(listener_id, True)
-        else:
-            await stop_listener(listener_id)
-            store.set_enabled(listener_id, False)
-    elif password or "username" in fields:
+    if "tls_enabled" in fields:
+        store.set_tls_enabled(listener_id, bool(fields["tls_enabled"]))
+    enabled = fields.get("enabled", bool(listener["enabled"]))
+    if not enabled:
         await stop_listener(listener_id)
+        store.set_enabled(listener_id, False)
+    elif config_changed or not listener_id in active:
         fresh = store.get_listener(listener_id)
-        if fresh["enabled"]:
-            try:
-                await start_listener(fresh)
-            except OSError as exc:
-                store.set_enabled(listener_id, False)
-                raise HTTPException(status_code=409, detail=f"Could not restart listener: {exc.strerror or 'port unavailable'}")
+        try:
+            await start_listener(fresh)
+        except OSError as exc:
+            store.set_enabled(listener_id, False)
+            raise HTTPException(status_code=409, detail=f"Could not start listener: {exc.strerror or str(exc) or 'listener configuration invalid'}")
+        store.set_enabled(listener_id, True)
     return {"ok": True}
 
 
@@ -263,9 +268,9 @@ LOGIN_HTML = r'''<!doctype html><html lang="ar" dir="rtl"><head><meta charset="u
 *{box-sizing:border-box}body{margin:0;background:#0b1220;color:#e8eef9;font-family:system-ui,Arial;min-height:100vh;display:grid;place-items:center}.card{width:min(420px,92vw);padding:32px;background:#121d30;border:1px solid #253653;border-radius:18px;box-shadow:0 20px 60px #0006}h1{margin:0 0 8px}p{color:#aebbd0}label{display:block;margin:18px 0 7px}input{width:100%;padding:12px;border-radius:9px;border:1px solid #344763;background:#0c1628;color:white;font-size:16px}button{width:100%;margin-top:22px;padding:12px;border:0;border-radius:9px;background:#5b8cff;color:#fff;font-weight:700;font-size:16px;cursor:pointer}.error{color:#ff9797;min-height:24px}.small{font-size:13px;line-height:1.6}</style></head><body><main class="card"><h1>لوحة إدارة الوكيل</h1><p>سجّل الدخول لإدارة منافذ HTTP/HTTPS Proxy.</p><form id="login"><label for="u">اسم المستخدم</label><input id="u" autocomplete="username" required><label for="p">كلمة المرور</label><input id="p" type="password" autocomplete="current-password" required><button>دخول آمن</button><div id="error" class="error" role="alert"></div></form><p class="small">استخدم HTTPS. شهادة التثبيت الافتراضية ذاتية التوقيع؛ تحقّق من عنوان الخادم قبل المتابعة.</p></main><script>document.querySelector('#login').onsubmit=async e=>{e.preventDefault();let r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.querySelector('#u').value,password:document.querySelector('#p').value})});if(r.ok)location.reload();else document.querySelector('#error').textContent=(await r.json()).detail||'تعذر تسجيل الدخول';};</script></body></html>'''
 
 PANEL_HTML = r'''<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Proxy Control</title><style>
-*{box-sizing:border-box}body{margin:0;background:#0b1220;color:#e8eef9;font-family:system-ui,Arial}.wrap{max-width:1100px;margin:auto;padding:28px 18px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}h1{margin:0}.sub{color:#aebbd0;margin:8px 0 24px}.box{background:#121d30;border:1px solid #253653;border-radius:16px;padding:20px;margin:16px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}label{display:block;margin:5px 0 7px;color:#c3cee0}input{width:100%;padding:11px;border-radius:8px;border:1px solid #344763;background:#0c1628;color:white;font-size:15px}button{padding:10px 15px;border:0;border-radius:8px;background:#5b8cff;color:white;font-weight:650;cursor:pointer}button.secondary{background:#283b57}button.danger{background:#9b3d4c}button:disabled{opacity:.5}form button{margin-top:14px}.notice{padding:12px;border-radius:9px;background:#202f48;color:#c8d7ef;line-height:1.7}.error{color:#ff9797;min-height:24px}.table{overflow:auto}table{width:100%;border-collapse:collapse;min-width:660px}td,th{text-align:right;padding:13px;border-bottom:1px solid #263651}th{color:#afc1dc}.badge{padding:4px 9px;border-radius:999px;background:#174b3d;color:#9bf0cb}.off{background:#4d3d1c;color:#ffdc88}.actions{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#aebbd0;font-size:13px}.check{display:flex;align-items:center;gap:9px;margin-top:30px}.check input{width:auto;transform:scale(1.15)}code{direction:ltr;display:inline-block;background:#09111e;padding:3px 6px;border-radius:5px}@media(max-width:600px){.wrap{padding:18px 12px}.box{padding:15px}}</style></head><body><main class="wrap"><div class="top"><h1>إدارة HTTP/HTTPS Proxy</h1><button class="secondary" onclick="logout()">تسجيل الخروج</button></div><p class="sub">أنشئ وأدر مستمعات الوكيل؛ كل منفذ يتطلب بيانات مصادقة مستقلة. TLS مفعّل افتراضيًا لحماية كلمة مرور الوكيل على الشبكة.</p><div class="notice">الأمان: المنافذ تُربط على <code>0.0.0.0</code> لتكون متاحة من الإنترنت. TLS للوكيل مفعّل افتراضيًا؛ اضبط شهادة موثوقة أو اربطها في عميلك. لا تعطّله إلا داخل شبكة خاصة موثوقة. افتح المنافذ المطلوبة فقط في جدار الحماية. الوصول إلى الشبكات الخاصة وعناوين metadata محظور.</div><section class="box"><h2>إضافة منفذ Proxy</h2><form id="create"><div class="grid"><div><label>المنفذ (1024–65535)</label><input id="port" type="number" min="1024" max="65535" required placeholder="مثال: 18080"></div><div><label>اسم مستخدم الوكيل</label><input id="username" maxlength="64" required></div><div><label>كلمة مرور الوكيل (12 حرفًا على الأقل)</label><input id="password" type="password" minlength="12" autocomplete="new-password" required></div><div class="check"><input id="tls" type="checkbox" checked><label for="tls">TLS على اتصال الوكيل (موصى به)</label></div></div><button>إنشاء وتشغيل المنفذ</button><div id="error" class="error"></div></form></section><section class="box"><h2>المنافذ المُدارة</h2><div class="table"><table><thead><tr><th>العنوان</th><th>اسم المستخدم</th><th>الحالة</th><th>أُنشئ في</th><th>إجراءات</th></tr></thead><tbody id="rows"></tbody></table></div><p id="empty" class="muted"></p></section><p class="muted">اتصال HTTP: استخدم عنوان الخادم والمنفذ وبيانات الاعتماد. HTTPS يعمل عبر طريقة CONNECT. يشار إلى مستمع TLS بعنوان https://، وغير المشفر بعنوان http://. لا تُعرض كلمات المرور المخزنة؛ استخدم تحديث بيانات الاعتماد لتغييرها.</p></main><script>
+*{box-sizing:border-box}body{margin:0;background:#0b1220;color:#e8eef9;font-family:system-ui,Arial}.wrap{max-width:1100px;margin:auto;padding:28px 18px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}h1{margin:0}.sub{color:#aebbd0;margin:8px 0 24px}.box{background:#121d30;border:1px solid #253653;border-radius:16px;padding:20px;margin:16px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}label{display:block;margin:5px 0 7px;color:#c3cee0}input{width:100%;padding:11px;border-radius:8px;border:1px solid #344763;background:#0c1628;color:white;font-size:15px}button{padding:10px 15px;border:0;border-radius:8px;background:#5b8cff;color:white;font-weight:650;cursor:pointer}button.secondary{background:#283b57}button.danger{background:#9b3d4c}button:disabled{opacity:.5}form button{margin-top:14px}.notice{padding:12px;border-radius:9px;background:#202f48;color:#c8d7ef;line-height:1.7}.error{color:#ff9797;min-height:24px}.table{overflow:auto}table{width:100%;border-collapse:collapse;min-width:660px}td,th{text-align:right;padding:13px;border-bottom:1px solid #263651}th{color:#afc1dc}.badge{padding:4px 9px;border-radius:999px;background:#174b3d;color:#9bf0cb}.off{background:#4d3d1c;color:#ffdc88}.actions{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#aebbd0;font-size:13px}.check{display:flex;align-items:center;gap:9px;margin-top:30px}.check input{width:auto;transform:scale(1.15)}code{direction:ltr;display:inline-block;background:#09111e;padding:3px 6px;border-radius:5px}@media(max-width:600px){.wrap{padding:18px 12px}.box{padding:15px}}</style></head><body><main class="wrap"><div class="top"><h1>إدارة HTTP/HTTPS Proxy</h1><button class="secondary" onclick="logout()">تسجيل الخروج</button></div><p class="sub">أنشئ وأدر مستمعات الوكيل؛ كل منفذ له بيانات دخول مستقلة. HTTP العادي هو الافتراضي لتوافق المتصفحات؛ TLS اختياري.</p><div class="notice">الأمان: المنافذ تُربط على <code>0.0.0.0</code> لتكون متاحة من الإنترنت. استخدم HTTP العادي عند إعداد المتصفح كـ HTTP Proxy؛ سيعمل HTTPS للمواقع عبر CONNECT. فعّل TLS فقط إذا كان عميلك يدعم HTTPS Proxy وضُبط على ذلك. كلمة المرور عبر HTTP غير مشفرة؛ استخدم TLS أو شبكة موثوقة، وافتح المنفذ في جدار الحماية. عنوان لوحة Sandbox/Preview ليس عنوان VPS ولا يمرر منافذ Proxy الإضافية.</div><section class="box"><h2>إضافة منفذ Proxy</h2><form id="create"><div class="grid"><div><label>المنفذ (1024–65535)</label><input id="port" type="number" min="1024" max="65535" required placeholder="مثال: 18080"></div><div><label>اسم مستخدم الوكيل</label><input id="username" maxlength="64" required></div><div><label>كلمة مرور الوكيل (3 أحرف على الأقل؛ اختر أطول للأمان)</label><input id="password" type="password" minlength="3" autocomplete="new-password" required></div><div class="check"><input id="tls" type="checkbox"><label for="tls">TLS بين العميل والوكيل (اختياري؛ يحتاج دعم HTTPS Proxy)</label></div></div><button>إنشاء وتشغيل المنفذ</button><div id="error" class="error"></div></form></section><section class="box"><h2>المنافذ المُدارة</h2><div class="table"><table><thead><tr><th>العنوان</th><th>اسم المستخدم</th><th>الحالة</th><th>أُنشئ في</th><th>إجراءات</th></tr></thead><tbody id="rows"></tbody></table></div><p id="empty" class="muted"></p></section><p class="muted">لإعداد المتصفح المعتاد اختر HTTP Proxy، ثم أدخل IP أو نطاق VPS والمنفذ وبيانات الدخول؛ HTTPS للمواقع يعمل عبر CONNECT. إذا فعّلت TLS فاختر HTTPS Proxy في العميل. لا تستخدم رابط Preview/Sandbox أو منفذ لوحة التحكم كعنوان Proxy؛ استخدم VPS وافتح منفذ Proxy في جدار الحماية. كلمات المرور لا يمكن عرضها بعد حفظها.</p></main><script>
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));async function api(url,method='GET',body){let r=await fetch(url,{method,headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});let d=await r.json().catch(()=>({}));if(r.status===401){location.reload();throw Error('انتهت الجلسة')}if(!r.ok)throw Error(d.detail||'حدث خطأ');return d}
-async function refresh(){let {listeners}=await api('/api/listeners');let rows=document.querySelector('#rows');rows.innerHTML='';document.querySelector('#empty').textContent=listeners.length?'':'لا توجد منافذ بعد.';for(let x of listeners){let tr=document.createElement('tr');tr.innerHTML=`<td><code>${esc(x.address)}</code></td><td>${esc(x.username)}</td><td><span class="badge ${x.running?'':'off'}">${x.running?'يعمل':'متوقف'}</span></td><td>${esc(x.created_at)}</td><td><div class="actions"><button class="secondary" onclick="toggle(${x.id},${!x.enabled})">${x.enabled?'إيقاف':'تشغيل'}</button><button class="secondary" onclick="credentials(${x.id})">تغيير بيانات الدخول</button><button class="danger" onclick="removeListener(${x.id})">حذف</button></div></td>`;rows.appendChild(tr)}}
+async function refresh(){let {listeners}=await api('/api/listeners');let rows=document.querySelector('#rows');rows.innerHTML='';document.querySelector('#empty').textContent=listeners.length?'':'لا توجد منافذ بعد.';for(let x of listeners){let tr=document.createElement('tr');tr.innerHTML=`<td><code>${esc(x.address)}</code></td><td>${esc(x.username)}</td><td><span class="badge ${x.running?'':'off'}">${x.running?'يعمل':'متوقف'}</span></td><td>${esc(x.created_at)}</td><td><div class="actions"><button class="secondary" onclick="toggle(${x.id},${!x.enabled})">${x.enabled?'إيقاف':'تشغيل'}</button><button class="secondary" onclick="setTls(${x.id},${!x.tls_enabled})">${x.tls_enabled?'تحويل إلى HTTP':'تفعيل TLS'}</button><button class="secondary" onclick="credentials(${x.id})">تغيير بيانات الدخول</button><button class="danger" onclick="removeListener(${x.id})">حذف</button></div></td>`;rows.appendChild(tr)}}
 document.querySelector('#create').onsubmit=async e=>{e.preventDefault();let er=document.querySelector('#error');er.textContent='';try{await api('/api/listeners','POST',{port:Number(document.querySelector('#port').value),username:document.querySelector('#username').value,password:document.querySelector('#password').value,tls_enabled:document.querySelector('#tls').checked});e.target.reset();await refresh()}catch(x){er.textContent=x.message}};
-async function toggle(id,enabled){try{await api('/api/listeners/'+id,'PATCH',{enabled});await refresh()}catch(e){alert(e.message)}}async function credentials(id){let username=prompt('اسم المستخدم الجديد:');if(username===null)return;let password=prompt('كلمة مرور جديدة (اتركها فارغة للإبقاء على الحالية):');if(password===null)return;try{await api('/api/listeners/'+id,'PATCH',{username,password:password||undefined});await refresh()}catch(e){alert(e.message)}}async function removeListener(id){if(!confirm('حذف هذا المنفذ نهائيًا؟'))return;try{await api('/api/listeners/'+id,'DELETE');await refresh()}catch(e){alert(e.message)}}async function logout(){await api('/api/logout','POST',{});location.reload()}refresh().catch(e=>document.querySelector('#rows').textContent=e.message);
+async function toggle(id,enabled){try{await api('/api/listeners/'+id,'PATCH',{enabled});await refresh()}catch(e){alert(e.message)}}async function setTls(id,tls_enabled){let msg=tls_enabled?'تفعيل TLS؟ تأكد أن عميلك مضبوط على HTTPS Proxy وأن شهادة الخادم موثوقة.':'إيقاف TLS واستخدام HTTP Proxy القياسي؟';if(!confirm(msg))return;try{await api('/api/listeners/'+id,'PATCH',{tls_enabled});await refresh()}catch(e){alert(e.message)}}async function credentials(id){let username=prompt('اسم المستخدم الجديد:');if(username===null)return;let password=prompt('كلمة مرور جديدة (3 أحرف على الأقل؛ اتركها فارغة للإبقاء على الحالية):');if(password===null)return;try{await api('/api/listeners/'+id,'PATCH',{username,password:password||undefined});await refresh()}catch(e){alert(e.message)}}async function removeListener(id){if(!confirm('حذف هذا المنفذ نهائيًا؟'))return;try{await api('/api/listeners/'+id,'DELETE');await refresh()}catch(e){alert(e.message)}}async function logout(){await api('/api/logout','POST',{});location.reload()}refresh().catch(e=>document.querySelector('#rows').textContent=e.message);
 </script></body></html>'''
